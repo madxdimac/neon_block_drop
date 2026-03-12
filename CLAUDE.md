@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-Everything lives in `index.html` as a single `<canvas>`-based game using the vanilla JS Canvas 2D API. The file is organized into clearly labelled sections (marked with `// ===...===` banners) in this order:
+Everything lives in `block_drop.html` as a single `<canvas>`-based game using the vanilla JS Canvas 2D API. The file is organized into clearly labelled sections (marked with `// ===...===` banners) in this order:
 
 1. **Canvas / constants** — `W`, `H`, `CELL`, `COLS`, `ROWS`, `BX`, `BY`, `BH`, lock-delay constants
 2. **Starfield** — parallax 3-layer background, runs every frame
@@ -23,7 +23,7 @@ Everything lives in `index.html` as a single `<canvas>`-based game using the van
 11. **Board rendering** — `drawBoard`, `drawGhost`, `drawCurrent`, `drawLockBar`
 12. **HUD** (right panel) — `drawHUD`: SCORE, LEVEL, LINES, COMBO, B2B badge, NEXT preview, SPEED bar
 13. **Controls panel** (left panel) — `drawControls`: key reference, auto-sizes via `BH`
-14. **Game header** — small "MAD BLOCKS" title drawn above the board during gameplay
+14. **Game header** — small "BLOCK DROP" title drawn above the board during gameplay
 15. **Intro screen** — `drawIntro`: title, level selector (◄ ►), key reference box
 16. **Shapes screen** — `drawShapesScreen`: grid of all 11 pieces with names
 17. **Overlays** — `drawPauseOverlay`, `drawGameOver`
@@ -49,6 +49,7 @@ The canvas is `800 × 740px` with three vertical panels side-by-side:
 - `BX` — left edge of the board; also sets the left-panel width (`BX-20`) and where the HUD begins
 - `LOCK_DELAY` (500ms) / `MAX_LOCK_RESETS` (15) — standard Guideline Tetris lock-delay values
 - HUD Y offsets are hardcoded relative to `hy=BY`; if `BH` changes significantly they need redistribution
+- **Line-clear removal order is critical** — in the flash completion handler, all `board.splice()` calls must happen before any `board.unshift()`. Interleaving them shifts row indices mid-loop and causes the wrong rows to be removed, leaving full rows on the board that then clear on the next piece lock.
 
 ## Visual aesthetic
 
