@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLOCK DROP</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  font-family: 'Courier New', monospace;
+  overflow: hidden;
+}
+canvas {
+  display: block;
+  border: 2px solid #0ff;
+  box-shadow: 0 0 30px #0ff, 0 0 60px rgba(0,255,255,0.2);
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// =============================================================================
+// BLOCK DROP — Neon Tetris-style game
+// =============================================================================
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+const W = 800, H = 740;
+canvas.width  = W;
+canvas.height = H;
+
+const CELL = 24;
+const COLS = 10, ROWS = 28;
+const BX = 260, BY = 50;
+const BH = ROWS * CELL;   // board height px = 672
+
+// Lock delay constants (standard Guideline Tetris)
+const LOCK_DELAY      = 500;   // ms before piece locks when grounded
+const MAX_LOCK_RESETS = 15;    // max move/rotate resets of lock timer
+
+// =============================================================================
+// STARFIELD
+// =============================================================================
+const stars = [];
+function initStars() {
+  stars.length = 0;
+  [{n:80,sp:0.15,sz:1,a:0.35},{n:50,sp:0.4,sz:1.5,a:0.6},{n:25,sp:0.9,sz:2,a:0.9}]
+    .forEach(l => { for (let i=0;i<l.n;i++) stars.push({x:Math.random()*W,y:Math.random()*H,sp:l.sp,sz:l.sz,a:l.a}); });
+}
+function tickStars() {
+  stars.forEach(s => { s.y += s.sp; if (s.y > H) { s.y=0; s.x=Math.random()*W; } });
+}
+function drawStars() {
+  stars.forEach(s => { ctx.globalAlpha=s.a; ctx.fillStyle='#fff'; ctx.fillRect(s.x,s.y,s.sz,s.sz); });
+  ctx.globalAlpha = 1;
+}
+
+// =============================================================================
+// PIECE DEFINITIONS  (7 tetrominoes + 4 special shapes)
+// =============================================================================
+const PIECE_DEFS = [
+  { shape:[[1,1,1,1]],               color:'hsl(180,100%,60%)' },  // I4  cyan
+  { shape:[[1],[1],[1],[1],[1]],      color:'hsl(350,100%,70%)' },  // I5  pink
+  { shape:[[1,1],[1,1]],             color:'hsl(55,100%,60%)'  },  // O   yellow
+  { shape:[[0,1,0],[1,1,1]],         color:'hsl(300,100%,65%)' },  // T   magenta
+  { shape:[[0,1,1],[1,1,0]],         color:'hsl(120,100%,60%)' },  // S   green
+  { shape:[[1,1,0],[0,1,1]],         color:'hsl(0,100%,65%)'   },  // Z   red
+  { shape:[[1,0],[1,0],[1,1]],       color:'hsl(30,100%,62%)'  },  // L   orange
+  { shape:[[0,1],[0,1],[1,1]],       color:'hsl(240,100%,72%)' },  // J   blue
+  { shape:[[0,1,0],[1,1,1],[0,1,0]], color:'hsl(270,100%,70%)' },  // +   purple
+  { shape:[[1,0,1],[1,1,1]],         color:'hsl(190,100%,60%)' },  // U   teal
+  { shape:[[1,1,1],[0,1,0],[0,1,0]], color:'hsl(80,100%,60%)'  },  // WT  lime
+];
+
+function rotateCW(shape) {
+  const R=shape.length, C=shape[0].length;
+  const out=Array.from({length:C},()=>Array(R).fill(0));
+  for (let r=0;r<R;r++) for (let c=0;c<C;c++) out[c][R-1-r]=shape[r][c];
+  return out;
+}
+function cloneShape(s) { return s.map(r=>[...r]); }
+
+const PIECE_NAMES = ['I-4','I-5','SQUARE','T-PIECE','S-PIECE','Z-PIECE','L-PIECE','J-PIECE','PLUS','U-SHAPE','WIDE-T'];
+
+// =============================================================================
+// GAME STATE
+// =============================================================================
+const S = { INTRO:'intro', SHAPES:'shapes', PLAY:'play', PAUSE:'pause', OVER:'over' };
+let state = S.INTRO;
+
+let board, current, next;
+let score, level, lines;           // lines = running total used for level formula
+let startLevel = 1;                // selected on intro screen
+let linesBase  = 0;                // = (startLevel-1)*10, offset for display
+
+let dropTimer = 0, dropInterval = 800;
+let lockTimer = 0, lockResets   = 0;  // lock delay state
+
+let flashRows=[], flashTimer=0, pendingClear=null;
+
+let combo = 0;       // consecutive line-clear streak
+let b2b   = false;   // back-to-back Tetris (4-line) active
+
+let particles=[], popups=[], tick=0;
+
+// =============================================================================
+// BOARD / PIECE HELPERS
+// =============================================================================
+function newBoard() { return Array.from({length:ROWS},()=>Array(COLS).fill(null)); }
+
+function randPiece() {
+  const d=PIECE_DEFS[Math.floor(Math.random()*PIECE_DEFS.length)];
+  return { shape:cloneShape(d.shape), color:d.color };
+}
+
+function spawnPiece() {
+  const p=next;
+  current={ shape:p.shape, color:p.color, x:Math.floor((COLS-p.shape[0].length)/2), y:0 };
+  next=randPiece();
+  lockTimer=0; lockResets=0;
+  if (!valid(current.shape,current.x,current.y)) state=S.OVER;
+}
+
+function startGame() {
+  board=newBoard();
+  linesBase=(startLevel-1)*10;
+  score=0; level=startLevel; lines=linesBase;
+  combo=0; b2b=false;
+  particles=[]; popups=[]; flashRows=[]; flashTimer=0; pendingClear=null;
+  next=randPiece();
+  spawnPiece();
+  dropTimer=0; lockTimer=0; lockResets=0;
+  dropInterval=Math.max(80,800-(startLevel-1)*70);
+  state=S.PLAY;
+}
+
+// =============================================================================
+// PHYSICS
+// =============================================================================
+function valid(shape,ox,oy) {
+  for (let r=0;r<shape.length;r++)
+    for (let c=0;c<shape[r].length;c++) {
+      if (!shape[r][c]) continue;
+      const nx=ox+c, ny=oy+r;
+      if (nx<0||nx>=COLS||ny>=ROWS) return false;
+      if (ny>=0&&board[ny][nx]) return false;
+    }
+  return true;
+}
+
+function ghostY() { let g=current.y; while(valid(current.shape,current.x,g+1))g++; return g; }
+
+function isGrounded() { return !valid(current.shape,current.x,current.y+1); }
+
+// Reset lock timer on move/rotate (up to MAX_LOCK_RESETS times)
+function resetLock() {
+  if (isGrounded() && lockResets < MAX_LOCK_RESETS) {
+    lockTimer=0; lockResets++;
+  }
+}
+
+function moveLeft()  { if(valid(current.shape,current.x-1,current.y)){current.x--; resetLock();} }
+function moveRight() { if(valid(current.shape,current.x+1,current.y)){current.x++; resetLock();} }
+
+// Returns true if piece moved down, false if blocked
+function moveDown() {
+  if (valid(current.shape,current.x,current.y+1)) { current.y++; return true; }
+  return false;
+}
+
+function doRotate() {
+  const rot=rotateCW(current.shape);
+  for (const k of [0,-1,1,-2,2]) {
+    if (valid(rot,current.x+k,current.y)) {
+      current.shape=rot; current.x+=k;
+      resetLock();
+      return;
+    }
+  }
+}
+
+function hardDrop() {
+  const gy=ghostY();
+  score += (gy-current.y)*2;   // 2pts per row hard-dropped
+  current.y=gy;
+  lockTimer=LOCK_DELAY;         // lock immediately
+  lock();
+}
+
+function lock() {
+  // Write piece to board
+  for (let r=0;r<current.shape.length;r++)
+    for (let c=0;c<current.shape[r].length;c++)
+      if (current.shape[r][c]) { const ny=current.y+r; if(ny>=0) board[ny][current.x+c]=current.color; }
+
+  lockTimer=0; lockResets=0;
+
+  // Find full rows
+  const full=[];
+  for (let r=0;r<ROWS;r++) if (board[r].every(v=>v!==null)) full.push(r);
+
+  if (full.length) {
+    // --- Scoring ---
+    const pts=[0,100,300,500,800];
+    let lineScore=(pts[Math.min(full.length,4)]||800)*level;
+
+    const isTetris=(full.length>=4);
+
+    // Back-to-back: consecutive Tetris clears get ×1.5
+    if (isTetris && b2b) {
+      lineScore=Math.floor(lineScore*1.5);
+      showPopup('BACK-TO-BACK!','#f0f',BX+COLS*CELL/2+BX/2, BY+100);
+    }
+    b2b=isTetris;
+
+    // Combo bonus: 50 × combo_count × level for each consecutive clear
+    combo++;
+    const comboBonus = combo>1 ? 50*(combo-1)*level : 0;
+
+    score += lineScore + comboBonus;
+
+    // Combo/clear popups
+    if (combo>1) showPopup(`COMBO ×${combo}  +${comboBonus}`,'#ff0',BX+COLS*CELL/2+BX/2,BY+130);
+    const names=['','SINGLE','DOUBLE','TRIPLE','TETRIS!'];
+    showPopup(names[Math.min(full.length,4)]||'ULTRA!',isTetris?'#f0f':'#0ff',BX+COLS*CELL/2+BX/2,BY+160);
+
+    // Update level
+    lines += full.length;
+    level  = Math.floor(lines/10)+1;
+    dropInterval=Math.max(80,800-(level-1)*70);
+
+    // Particles
+    full.forEach(row => {
+      for (let c=0;c<COLS;c++) for (let i=0;i<5;i++)
+        addParticle(BX+c*CELL+CELL/2, BY+row*CELL+CELL/2, board[row][c]);
+    });
+
+    flashRows=full; flashTimer=22; pendingClear=full;
+  } else {
+    combo=0;    // streak broken
+    spawnPiece();
+  }
+}
+
+// =============================================================================
+// PARTICLES
+// =============================================================================
+function addParticle(x,y,color) {
+  const a=Math.random()*Math.PI*2, sp=1+Math.random()*4, life=35+Math.random()*25;
+  particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,color:color||'#0ff',life,maxLife:life,sz:1.5+Math.random()*2});
+}
+function tickParticles() {
+  for (let i=particles.length-1;i>=0;i--) {
+    const p=particles[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=0.08; p.vx*=0.96; p.life--;
+    if (p.life<=0) particles.splice(i,1);
+  }
+}
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.globalAlpha=(p.life/p.maxLife)*0.9;
+    glow(p.color,8); ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.sz/2,p.y-p.sz/2,p.sz,p.sz); noGlow();
+  });
+  ctx.globalAlpha=1;
+}
+
+// =============================================================================
+// POPUPS  (floating score/combo notifications)
+// =============================================================================
+function showPopup(text,color,x,y) {
+  popups.push({text,color,x:x||W/2,y:y||BY+200,vy:-1.2,life:70,maxLife:70});
+}
+function tickPopups() {
+  for (let i=popups.length-1;i>=0;i--) {
+    const p=popups[i]; p.y+=p.vy; p.life--;
+    if (p.life<=0) popups.splice(i,1);
+  }
+}
+function drawPopups() {
+  popups.forEach(p => {
+    ctx.globalAlpha=Math.min(1,(p.life/p.maxLife)*2);
+    txt(p.text,p.x,p.y,15,p.color,'center',18);
+    ctx.globalAlpha=1;
+  });
+}
+
+// =============================================================================
+// INPUT  (DAS / ARR)
+// =============================================================================
+const keysDown=new Set(), keyNext={};
+const DAS=140, ARR=45;
+
+document.addEventListener('keydown', e => {
+  e.preventDefault();
+  if (keysDown.has(e.code)) return;
+  keysDown.add(e.code); keyNext[e.code]=performance.now()+DAS;
+  onKey(e.code);
+});
+document.addEventListener('keyup', e => { keysDown.delete(e.code); delete keyNext[e.code]; });
+
+function onKey(code) {
+  if (state===S.INTRO) {
+    if (code==='Enter'||code==='Space')      state=S.SHAPES;
+    if (code==='ArrowLeft'||code==='KeyA')   startLevel=Math.max(1,startLevel-1);
+    if (code==='ArrowRight'||code==='KeyD')  startLevel=Math.min(15,startLevel+1);
+    return;
+  }
+  if (state===S.SHAPES) {
+    if (code==='Enter'||code==='Space') startGame();
+    if (code==='Escape')                state=S.INTRO;
+    return;
+  }
+  if (state===S.OVER) {
+    if (code==='Enter'||code==='Space') state=S.INTRO;
+    return;
+  }
+  if (code==='KeyP'||code==='Escape') { state=state===S.PAUSE?S.PLAY:S.PAUSE; return; }
+  if (state===S.PAUSE||flashTimer>0) return;
+  if (code==='ArrowLeft')  moveLeft();
+  if (code==='ArrowRight') moveRight();
+  if (code==='ArrowDown')  { if(moveDown()) score+=1; dropTimer=0; }   // soft drop: +1/row
+  if (code==='ArrowUp')    doRotate();
+  if (code==='Space')      hardDrop();
+}
+
+function processARR(now) {
+  if (state!==S.PLAY||flashTimer>0) return;
+  for (const code of ['ArrowLeft','ArrowRight','ArrowDown']) {
+    if (keysDown.has(code)&&now>=(keyNext[code]||Infinity)) {
+      keyNext[code]=now+ARR;
+      if (code==='ArrowLeft')  moveLeft();
+      if (code==='ArrowRight') moveRight();
+      if (code==='ArrowDown')  { if(moveDown()) score+=1; dropTimer=0; }
+    }
+  }
+}
+
+// =============================================================================
+// DRAW HELPERS
+// =============================================================================
+function glow(color,blur)  { ctx.shadowColor=color; ctx.shadowBlur=blur; }
+function noGlow()          { ctx.shadowBlur=0; }
+function roundRect(x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
+}
+function txt(t,x,y,size,color,align,blur) {
+  ctx.font=`bold ${size}px 'Courier New',monospace`;
+  ctx.textAlign=align||'left'; ctx.fillStyle=color;
+  glow(color,blur??10); ctx.fillText(t,x,y); noGlow();
+}
+function drawCell(px,py,color,alpha) {
+  ctx.globalAlpha=alpha??1;
+  glow(color,14); ctx.fillStyle=color;
+  ctx.fillRect(px+1,py+1,CELL-2,CELL-2);
+  ctx.fillStyle='rgba(255,255,255,0.18)';
+  ctx.fillRect(px+2,py+2,CELL-4,4);
+  noGlow(); ctx.globalAlpha=1;
+}
+function divider(x,y,w) {
+  glow('#0ff',3); ctx.strokeStyle='rgba(0,255,255,0.25)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+w,y); ctx.stroke(); noGlow();
+}
+
+// =============================================================================
+// BOARD RENDERING
+// =============================================================================
+function drawBoard() {
+  ctx.fillStyle='rgba(0,10,20,0.85)';
+  ctx.fillRect(BX,BY,COLS*CELL,ROWS*CELL);
+
+  ctx.strokeStyle='rgba(0,255,255,0.07)'; ctx.lineWidth=0.5;
+  for(let r=0;r<=ROWS;r++){ctx.beginPath();ctx.moveTo(BX,BY+r*CELL);ctx.lineTo(BX+COLS*CELL,BY+r*CELL);ctx.stroke();}
+  for(let c=0;c<=COLS;c++){ctx.beginPath();ctx.moveTo(BX+c*CELL,BY);ctx.lineTo(BX+c*CELL,BY+ROWS*CELL);ctx.stroke();}
+
+  glow('#0ff',22); ctx.strokeStyle='#0ff'; ctx.lineWidth=2;
+  ctx.strokeRect(BX-1,BY-1,COLS*CELL+2,ROWS*CELL+2); noGlow();
+
+  for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++) {
+    if (!board[r][c]) continue;
+    if (flashRows.includes(r)) {
+      const t=(Math.sin(tick*1.4)+1)*0.5;
+      ctx.globalAlpha=0.5+t*0.5; glow('#fff',25);
+      ctx.fillStyle='#fff'; ctx.fillRect(BX+c*CELL+1,BY+r*CELL+1,CELL-2,CELL-2);
+      noGlow(); ctx.globalAlpha=1;
+    } else {
+      drawCell(BX+c*CELL,BY+r*CELL,board[r][c]);
+    }
+  }
+}
+
+function drawGhost() {
+  const gy=ghostY(); if(gy===current.y) return;
+  ctx.globalAlpha=0.22;
+  current.shape.forEach((row,r)=>row.forEach((v,c)=>{
+    if(!v) return;
+    glow(current.color,6); ctx.strokeStyle=current.color; ctx.lineWidth=1.5;
+    ctx.strokeRect(BX+(current.x+c)*CELL+2,BY+(gy+r)*CELL+2,CELL-4,CELL-4); noGlow();
+  }));
+  ctx.globalAlpha=1;
+}
+
+function drawCurrent() {
+  current.shape.forEach((row,r)=>row.forEach((v,c)=>{
+    if(v) drawCell(BX+(current.x+c)*CELL,BY+(current.y+r)*CELL,current.color);
+  }));
+}
+
+// Lock delay progress bar — drawn at bottom edge of current piece
+function drawLockBar() {
+  if (lockTimer<=0) return;
+  const remaining=1-(lockTimer/LOCK_DELAY);
+  const pw=current.shape[0].length*CELL;
+  const px=BX+current.x*CELL;
+  const py=BY+(current.y+current.shape.length)*CELL;
+  const bh=4;
+  // track
+  ctx.fillStyle='rgba(255,255,255,0.1)';
+  ctx.fillRect(px,py,pw,bh);
+  // fill (shrinks as lock approaches)
+  const barColor=`hsl(${Math.floor(remaining*60)},100%,60%)`;  // yellow → red
+  glow(barColor,8); ctx.fillStyle=barColor;
+  ctx.fillRect(px,py,pw*remaining,bh); noGlow();
+}
+
+// =============================================================================
+// HUD  (right panel)
+// =============================================================================
+function drawHUD() {
+  const hx=BX+COLS*CELL+18, hy=BY, hw=W-hx-10;
+  const mx=hx+hw/2;
+
+  // Panel
+  ctx.fillStyle='rgba(0,12,22,0.78)'; roundRect(hx,hy,hw,BH,6); ctx.fill();
+  glow('#0ff',6); ctx.strokeStyle='rgba(0,255,255,0.3)'; ctx.lineWidth=1;
+  roundRect(hx,hy,hw,BH,6); ctx.stroke(); noGlow();
+
+  // SCORE
+  txt('SCORE',mx,hy+32, 11,'#0ff','center',5);
+  txt(score+'',mx,hy+60, 22,'#fff','center',16);
+  divider(hx+8,hy+78,hw-16);
+
+  // LEVEL
+  txt('LEVEL',mx,hy+106, 11,'#0ff','center',5);
+  txt(level+'',mx,hy+134, 22,'#fff','center',16);
+  divider(hx+8,hy+152,hw-16);
+
+  // LINES (display cleared lines this game)
+  const cleared=lines-linesBase;
+  txt('LINES',mx,hy+180,11,'#0ff','center',5);
+  txt(cleared+'',mx,hy+208,22,'#fff','center',16);
+  divider(hx+8,hy+226,hw-16);
+
+  // COMBO
+  const comboColor=combo>1?'#ff0':'rgba(255,255,0,0.25)';
+  txt('COMBO',mx,hy+254,11,comboColor,'center',combo>1?8:2);
+  txt(combo>0?`×${combo}`:'×0',mx,hy+282,22,comboColor,'center',combo>1?14:2);
+
+  // B2B badge
+  if (b2b) {
+    const bw=hw-24, bx2=hx+12;
+    ctx.fillStyle='rgba(255,0,255,0.12)'; roundRect(bx2,hy+292,bw,18,4); ctx.fill();
+    glow('#f0f',10); ctx.strokeStyle='#f0f'; ctx.lineWidth=1;
+    roundRect(bx2,hy+292,bw,18,4); ctx.stroke(); noGlow();
+    txt('BACK-TO-BACK',mx,hy+305,9,'#f0f','center',8);
+  }
+
+  divider(hx+8,hy+328,hw-16);
+
+  // NEXT piece preview
+  txt('NEXT',mx,hy+356,11,'#0ff','center',5);
+  const ps=24;
+  const pw2=next.shape[0].length*ps;
+  const px0=hx+(hw-pw2)/2, py0=hy+370;
+  next.shape.forEach((row,r)=>row.forEach((v,c)=>{
+    if(!v) return;
+    glow(next.color,10); ctx.globalAlpha=0.9; ctx.fillStyle=next.color;
+    ctx.fillRect(px0+c*ps+1,py0+r*ps+1,ps-2,ps-2);
+    ctx.fillStyle='rgba(255,255,255,0.15)'; ctx.fillRect(px0+c*ps+2,py0+r*ps+2,ps-4,3);
+    noGlow(); ctx.globalAlpha=1;
+  }));
+
+  // SPEED bar
+  const barY=hy+BH-56;
+  divider(hx+8,barY-18,hw-16);
+  txt('SPEED',mx,barY+4,11,'#0ff','center',5);
+  const pct=Math.min((level-1)/20,1);
+  ctx.fillStyle='rgba(0,255,255,0.12)'; roundRect(hx+10,barY+16,hw-20,10,4); ctx.fill();
+  const bc=`hsl(${120-pct*120},100%,60%)`;
+  glow(bc,8); ctx.fillStyle=bc; roundRect(hx+10,barY+16,(hw-20)*pct,10,4); ctx.fill(); noGlow();
+}
+
+// =============================================================================
+// CONTROLS PANEL  (left panel)
+// =============================================================================
+function drawControls() {
+  const cx=10, cy=BY, cw=BX-20, mid=cx+cw/2;
+
+  ctx.fillStyle='rgba(0,12,22,0.78)'; roundRect(cx,cy,cw,BH,6); ctx.fill();
+  glow('#0ff',6); ctx.strokeStyle='rgba(0,255,255,0.3)'; ctx.lineWidth=1;
+  roundRect(cx,cy,cw,BH,6); ctx.stroke(); noGlow();
+
+  txt('CONTROLS',mid,cy+26,11,'#0ff','center',7);
+  divider(cx+8,cy+34,cw-16);
+
+  const items=[
+    ['← / →','MOVE'],
+    ['↑','ROTATE'],
+    ['↓','SOFT DROP'],
+    ['SPACE','HARD DROP'],
+    ['P / ESC','PAUSE'],
+  ];
+  const itemH=Math.floor((BH-48)/items.length);
+  items.forEach(([key,label],i)=>{
+    const ky=cy+48+i*itemH;
+    const kw=cw-24, kh=26, kx=cx+12;
+    glow('#0ff',10); ctx.strokeStyle='#0ff'; ctx.lineWidth=1.2;
+    roundRect(kx,ky,kw,kh,4); ctx.stroke();
+    ctx.fillStyle='rgba(0,255,255,0.06)'; roundRect(kx,ky,kw,kh,4); ctx.fill(); noGlow();
+    txt(key,  mid,ky+18,13,'#fff','center',4);
+    txt(label,mid,ky+38,10,'rgba(0,255,255,0.6)','center',0);
+  });
+}
+
+// =============================================================================
+// GAME SCREEN HEADER
+// =============================================================================
+function drawGameHeader() {
+  txt('BLOCK DROP',W/2,34,22,'#0ff','center',20);
+}
+
+// =============================================================================
+// INTRO SCREEN
+// =============================================================================
+function drawIntro() {
+  const cx=W/2, cy=H/2;
+
+  // Title — layered glow
+  ctx.font="bold 88px 'Courier New',monospace"; ctx.textAlign='center';
+  glow('#0ff',55); ctx.fillStyle='rgba(0,255,255,0.25)'; ctx.fillText('BLOCK DROP',cx,cy-120);
+  glow('#0ff',28); ctx.fillStyle='#0ff';                 ctx.fillText('BLOCK DROP',cx,cy-120);
+  noGlow();        ctx.fillStyle='#fff';                 ctx.fillText('BLOCK DROP',cx,cy-120);
+
+  // Decorative flanking lines
+  glow('#0ff',8); ctx.strokeStyle='rgba(0,255,255,0.5)'; ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(cx-240,cy-97); ctx.lineTo(cx-14,cy-97);
+  ctx.moveTo(cx+14, cy-97); ctx.lineTo(cx+240,cy-97);
+  ctx.stroke(); noGlow();
+
+  txt('NEON BLOCK STACKER',cx,cy-68,15,'rgba(0,255,255,0.65)','center',8);
+
+  // ── Level selector ──
+  const lsy=cy-30;
+  txt('STARTING LEVEL',cx,lsy,11,'#0ff','center',6);
+
+  // Left / right arrows
+  const arrowAlpha=Math.floor(tick/20)%2===0?1:0.5;
+  ctx.globalAlpha=arrowAlpha;
+  txt('◄',cx-70,lsy+32,18,'#0ff','center',12);
+  txt('►',cx+70,lsy+32,18,'#0ff','center',12);
+  ctx.globalAlpha=1;
+
+  // Level number box
+  const lbw=60, lbh=36, lbx=cx-30, lby=lsy+8;
+  ctx.fillStyle='rgba(0,255,255,0.1)'; roundRect(lbx,lby,lbw,lbh,6); ctx.fill();
+  glow('#0ff',14); ctx.strokeStyle='#0ff'; ctx.lineWidth=1.5;
+  roundRect(lbx,lby,lbw,lbh,6); ctx.stroke(); noGlow();
+  txt(startLevel+'',cx,lsy+36,22,'#fff','center',14);
+
+  // Speed preview label
+  const previewInterval=Math.max(80,800-(startLevel-1)*70);
+  txt(`DROP SPEED: ${previewInterval}ms`,cx,lsy+58,10,'rgba(0,255,255,0.5)','center',3);
+
+  // ── Key reference ──
+  const bx=cx-130, bw=260, bh=148, bby=cy+45;
+  ctx.fillStyle='rgba(0,12,22,0.85)'; roundRect(bx,bby,bw,bh,8); ctx.fill();
+  glow('#0ff',8); ctx.strokeStyle='rgba(0,255,255,0.4)'; ctx.lineWidth=1;
+  roundRect(bx,bby,bw,bh,8); ctx.stroke(); noGlow();
+
+  const rows=[['◄ ►','SELECT LEVEL'],['← / →','MOVE'],['↑','ROTATE'],['↓','SOFT DROP (+1)'],['SPACE','HARD DROP (+2×dist)']];
+  rows.forEach(([k,v],i)=>{
+    txt(k, bx+12,  bby+26+i*26,11,'#fff','left',4);
+    txt(v, bx+248, bby+26+i*26,10,'rgba(0,255,255,0.7)','right',2);
+  });
+
+  // Blink prompt
+  if (Math.floor(tick/28)%2===0) txt('PRESS ENTER TO VIEW SHAPES  →',cx,cy+220,15,'#fff','center',14);
+}
+
+// =============================================================================
+// SHAPES SCREEN
+// =============================================================================
+function drawShapesScreen() {
+  const cx=W/2;
+
+  // Title
+  ctx.font="bold 46px 'Courier New',monospace"; ctx.textAlign='center';
+  glow('#0ff',30); ctx.fillStyle='#0ff'; ctx.fillText('BLOCK SHAPES',cx,58); noGlow();
+  ctx.fillStyle='#fff';                        ctx.fillText('BLOCK SHAPES',cx,58);
+  txt('ALL PIECES IN PLAY',cx,84,12,'rgba(0,255,255,0.6)','center',6);
+
+  // Decorative line
+  glow('#0ff',6); ctx.strokeStyle='rgba(0,255,255,0.35)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(cx-220,96); ctx.lineTo(cx+220,96); ctx.stroke(); noGlow();
+
+  // Grid layout: 4 cols, 3 rows  (11 pieces = 4+4+3)
+  const ps=22;          // preview cell size
+  const slotW=174, slotH=138;
+  const gridCols=4;
+  const gridRows=Math.ceil(PIECE_DEFS.length/gridCols);
+  const gridW=gridCols*slotW;
+  const startX=(W-gridW)/2;
+  const startY=108;
+
+  PIECE_DEFS.forEach((def,i)=>{
+    const col=i%gridCols;
+    const row=Math.floor(i/gridCols);
+    const isLastRow=(row===gridRows-1);
+    const lastRowCount=PIECE_DEFS.length%gridCols||gridCols;
+    const rowOffset=isLastRow?(gridCols-lastRowCount)*slotW/2:0;
+
+    const sx=startX+col*slotW+rowOffset;
+    const sy=startY+row*slotH;
+
+    // Slot background
+    ctx.fillStyle='rgba(0,10,20,0.75)';
+    roundRect(sx+5,sy+5,slotW-10,slotH-10,6); ctx.fill();
+    glow(def.color,8); ctx.strokeStyle=def.color; ctx.lineWidth=1;
+    roundRect(sx+5,sy+5,slotW-10,slotH-10,6); ctx.stroke(); noGlow();
+
+    // Piece centered in slot (reserve 22px at bottom for label)
+    const pw=def.shape[0].length*ps;
+    const ph=def.shape.length*ps;
+    const px0=sx+(slotW-pw)/2;
+    const py0=sy+5+((slotH-22-ph)/2);
+
+    def.shape.forEach((r2,r)=>r2.forEach((v,c)=>{
+      if(!v) return;
+      glow(def.color,10); ctx.globalAlpha=0.92; ctx.fillStyle=def.color;
+      ctx.fillRect(px0+c*ps+1,py0+r*ps+1,ps-2,ps-2);
+      ctx.fillStyle='rgba(255,255,255,0.2)'; ctx.fillRect(px0+c*ps+2,py0+r*ps+2,ps-4,3);
+      noGlow(); ctx.globalAlpha=1;
+    }));
+
+    // Label
+    txt(PIECE_NAMES[i],sx+slotW/2,sy+slotH-10,9,def.color,'center',4);
+  });
+
+  // Navigation hints
+  if (Math.floor(tick/28)%2===0) txt('PRESS ENTER TO PLAY',cx,H-28,16,'#fff','center',14);
+  txt('ESC  BACK',cx,H-10,9,'rgba(0,255,255,0.4)','center',2);
+}
+
+// =============================================================================
+// OVERLAYS
+// =============================================================================
+function drawPauseOverlay() {
+  ctx.fillStyle='rgba(0,0,0,0.65)'; ctx.fillRect(0,0,W,H);
+  glow('#0ff',32); ctx.font="bold 56px 'Courier New',monospace"; ctx.textAlign='center';
+  ctx.fillStyle='#0ff'; ctx.fillText('PAUSED',W/2,H/2-10); noGlow();
+  txt('PRESS P TO RESUME',W/2,H/2+44,14,'rgba(255,255,255,0.7)','center',6);
+}
+
+function drawGameOver() {
+  ctx.fillStyle='rgba(0,0,0,0.78)'; ctx.fillRect(0,0,W,H);
+  glow('#f33',35); ctx.font="bold 60px 'Courier New',monospace"; ctx.textAlign='center';
+  ctx.fillStyle='#f33'; ctx.fillText('GAME OVER',W/2,H/2-60); noGlow();
+  txt(`SCORE: ${score}`,W/2,H/2+2, 24,'#0ff','center',14);
+  const cleared=lines-linesBase;
+  txt(`LEVEL ${level}  —  ${cleared} LINES`,W/2,H/2+44,13,'rgba(255,255,255,0.55)','center',5);
+  if (Math.floor(tick/28)%2===0) txt('PRESS ENTER TO RESTART',W/2,H/2+96,16,'#fff','center',10);
+}
+
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+let lastTs=0;
+function loop(ts) {
+  const dt=Math.min(ts-lastTs,50); lastTs=ts; tick++;
+
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  tickStars(); drawStars();
+
+  if (state===S.INTRO) {
+    drawIntro();
+
+  } else if (state===S.SHAPES) {
+    drawShapesScreen();
+
+  } else if (state===S.PLAY||state===S.PAUSE) {
+
+    if (state===S.PLAY) {
+      processARR(ts);
+
+      if (flashTimer>0) {
+        // Waiting for line-clear flash animation to finish
+        flashTimer--;
+        if (flashTimer===0&&pendingClear) {
+          pendingClear.sort((a,b)=>b-a);
+          pendingClear.forEach(r=>{ board.splice(r,1); board.unshift(Array(COLS).fill(null)); });
+          flashRows=[]; pendingClear=null;
+          spawnPiece();
+        }
+      } else {
+        // Natural gravity
+        dropTimer+=dt;
+        if (dropTimer>=dropInterval) { dropTimer=0; moveDown(); }
+
+        // Lock delay: tick when piece is grounded
+        if (isGrounded()) {
+          lockTimer+=dt;
+          if (lockTimer>=LOCK_DELAY) lock();
+        } else {
+          lockTimer=0;
+        }
+      }
+      tickParticles(); tickPopups();
+    }
+
+    drawBoard();
+    if (state===S.PLAY&&flashTimer===0) { drawGhost(); drawCurrent(); drawLockBar(); }
+    else if (state===S.PLAY)            { drawCurrent(); }
+    drawHUD(); drawControls(); drawParticles(); drawPopups(); drawGameHeader();
+    if (state===S.PAUSE) drawPauseOverlay();
+
+  } else if (state===S.OVER) {
+    drawBoard(); drawHUD(); drawControls(); drawParticles(); drawPopups();
+    tickParticles(); tickPopups(); drawGameHeader(); drawGameOver();
+  }
+
+  requestAnimationFrame(loop);
+}
+
+// =============================================================================
+// BOOT
+// =============================================================================
+initStars();
+board=newBoard(); score=0; level=1; lines=0; linesBase=0;
+combo=0; b2b=false; particles=[]; popups=[]; flashRows=[]; flashTimer=0; next=randPiece();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
