@@ -707,7 +707,8 @@ function loop(ts) {
         flashTimer--;
         if (flashTimer===0&&pendingClear) {
           pendingClear.sort((a,b)=>b-a);
-          pendingClear.forEach(r=>{ board.splice(r,1); board.unshift(Array(COLS).fill(null)); });
+          pendingClear.forEach(r=>board.splice(r,1));
+          for(let i=0;i<pendingClear.length;i++) board.unshift(Array(COLS).fill(null));
           flashRows=[]; pendingClear=null;
           spawnPiece();
         }
